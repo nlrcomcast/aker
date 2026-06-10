@@ -38,6 +38,7 @@
 #include "breakpad_wrapper.h"
 #endif
 
+#define LOOKAHEAD_SECONDS 900 //15 minutes
 
 /* Local Functions and file-scoped variables */
 static void calculate_report_jitter( uint32_t rate, uint32_t *jitter );
@@ -51,6 +52,10 @@ static char *current_blocked_macs = NULL;
 static pthread_mutex_t schedule_lock;
 static pthread_cond_t cond_var = PTHREAD_COND_INITIALIZER;
 static int report_metrics_to_log = 0;
+static int lookahead_starting_sent = 0;
+static time_t lookahead_starting_target = 0;
+static int lookahead_ending_sent = 0;
+static time_t lookahead_ending_target = 0;
 
 /*----------------------------------------------------------------------------*/
 /*                             External functions                             */
@@ -85,7 +90,7 @@ int scheduler_start( pthread_t *thread, const char *firewall_cmd )
 
 
 /* See scheduler.h for details. */
-int process_schedule_data( size_t len, uint8_t *data )
+int process_schedule_data( size_t len, uint8_t *data)
 {
     schedule_t *s = NULL;
     int rv = 0;
@@ -112,6 +117,11 @@ int process_schedule_data( size_t len, uint8_t *data )
             pthread_mutex_lock( &schedule_lock );
             tmp = current_schedule;
             current_schedule = s;
+            //Invalidate pending lookahead notifications for the old schedule
+            lookahead_starting_sent = 0;
+            lookahead_ending_sent = 0;
+            lookahead_starting_target = 0;
+            lookahead_ending_target = 0;
             pthread_mutex_unlock( &schedule_lock );
             pthread_cond_signal(&cond_var);
             destroy_schedule(tmp);
@@ -186,6 +196,7 @@ void *scheduler_thread(void *args)
     while( __keep_going__ ) {
         int info_period = 3;
         int schedule_changed = 0;
+        char *prev_blocked = NULL;
    
         pthread_mutex_lock( &schedule_lock );
         
@@ -193,6 +204,7 @@ void *scheduler_thread(void *args)
             char *blocked_macs;
 
             current_unix_time = get_unix_time();
+            prev_blocked = current_blocked_macs ? strdup(current_blocked_macs) : NULL;
             blocked_macs = get_blocked_at_time(current_schedule, current_unix_time);
             debug_info("Time to process current schedule event is %ld seconds\n", (get_unix_time() - current_unix_time));
 
@@ -247,6 +259,27 @@ void *scheduler_thread(void *args)
             }
             call_firewall( firewall_cmd, current_blocked_macs );
 
+            //notifications (STARTED / ENDED)
+            if( NULL == prev_blocked && NULL != current_blocked_macs ) {
+                //unblocked -> blocked: DOWNTIME_STARTED
+                debug_info("NOTIFY_EVENT_DOWNTIME_STARTED,current_unix_time=%ld,current_time_zone=%s,blocked_macs=%s\n",
+                                 current_unix_time,
+                                 current_schedule ? current_schedule->time_zone : NULL,
+                                 current_blocked_macs);
+                //Reset starting-soon flag since we've started
+                lookahead_starting_sent = 0;
+                lookahead_starting_target = 0;
+            } else if( NULL != prev_blocked && NULL == current_blocked_macs ) {
+                //blocked -> unblocked: DOWNTIME_ENDED
+                debug_info("NOTIFY_EVENT_DOWNTIME_ENDED,current_unix_time=%ld,current_time_zone=%s,blocked_macs=%s\n",
+                                 current_unix_time,
+                                 current_schedule ? current_schedule->time_zone : NULL,
+                                 prev_blocked);
+                //Reset ending-soon flag since we've ended
+                lookahead_ending_sent = 0;
+                lookahead_ending_target = 0;
+            }
+
             /* Only if the reporting rate changes, calculate a new report rate jitter */
             if( current_schedule && 
                 last_report_rate != current_schedule->report_rate_s )
@@ -259,6 +292,55 @@ void *scheduler_thread(void *args)
                 calculate_report_jitter( current_schedule->report_rate_s,
                                          &report_jitter );
                 last_report_time += report_jitter;
+            }
+        }
+
+        if( prev_blocked ) {
+            aker_free(prev_blocked);
+            prev_blocked = NULL;
+        }
+
+        //15-minute lookahead notifications
+        if( current_schedule ) {
+            time_t next_event = get_next_unixtime(current_schedule, current_unix_time);
+
+            if( next_event > 0 && next_event < INT_MAX ) {
+                time_t lookahead_time = next_event - LOOKAHEAD_SECONDS;
+
+                if( NULL == current_blocked_macs ) {
+                    // Currently unblocked — next event starts blocking
+                    if( !lookahead_starting_sent &&
+                        current_unix_time >= lookahead_time &&
+                        current_unix_time < next_event &&
+                        next_event != lookahead_starting_target )
+                    {
+                        char *future_macs = get_blocked_at_time(current_schedule, next_event);
+                        if( future_macs ) {
+                            debug_info("NOTIFY_EVENT_DOWNTIME_STARTING_SOON, next_event=%ld,current_time_zone=%s,blocked_macs=%s\n",
+
+                                             next_event,
+                                             current_schedule->time_zone,
+                                             future_macs);
+                            aker_free(future_macs);
+                        }
+                        lookahead_starting_sent = 1;
+                        lookahead_starting_target = next_event;
+                    }
+                } else {
+                    // Currently blocked — next event ends blocking
+                    if( !lookahead_ending_sent &&
+                        current_unix_time >= lookahead_time &&
+                        current_unix_time < next_event &&
+                        next_event != lookahead_ending_target )
+                    {
+                        debug_info("NOTIFY_EVENT_DOWNTIME_ENDING_SOON, next_event=%ld,current_time_zone=%s,blocked_macs=%s\n",
+                                         next_event,
+                                         current_schedule->time_zone,
+                                         current_blocked_macs);
+                        lookahead_ending_sent = 1;
+                        lookahead_ending_target = next_event;
+                    }
+                }
             }
         }
 
@@ -282,6 +364,14 @@ void *scheduler_thread(void *args)
         }
 
         tm.tv_sec = get_next_unixtime(current_schedule, current_unix_time);
+
+        /* Also wake up for 15-minute lookahead if applicable */
+        if( current_schedule && tm.tv_sec > 0 && tm.tv_sec < INT_MAX ) {
+            time_t lookahead_wake = tm.tv_sec - LOOKAHEAD_SECONDS;
+            if( lookahead_wake > current_unix_time && lookahead_wake < tm.tv_sec ) {
+                tm.tv_sec = lookahead_wake;
+            }
+        }
 
         /* Choose the earlier time of reporting or the next event. */
         if( next_report_time < tm.tv_sec ) {
