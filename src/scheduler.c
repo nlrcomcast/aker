@@ -33,6 +33,7 @@
 #include "time.h"
 #include "aker_mem.h"
 #include "aker_metrics.h"
+#include "aker_notify.h"
 
 #ifdef INCLUDE_BREAKPAD
 #include "breakpad_wrapper.h"
@@ -51,6 +52,11 @@ static char *current_blocked_macs = NULL;
 static pthread_mutex_t schedule_lock;
 static pthread_cond_t cond_var = PTHREAD_COND_INITIALIZER;
 static int report_metrics_to_log = 0;
+
+#if defined(ENABLE_FEATURE_TELEMETRY2_0)
+static notification_event_t *current_notifications = NULL;
+static notification_event_t *next_pending_notification = NULL;
+#endif
 
 /*----------------------------------------------------------------------------*/
 /*                             External functions                             */
@@ -96,6 +102,11 @@ int process_schedule_data( size_t len, uint8_t *data )
         pthread_mutex_lock( &schedule_lock );
         s = current_schedule;
         current_schedule = NULL;
+#if defined(ENABLE_FEATURE_TELEMETRY2_0)
+        destroy_notification_list(current_notifications);
+        current_notifications = NULL;
+        next_pending_notification = NULL;
+#endif
         pthread_mutex_unlock( &schedule_lock );
         pthread_cond_signal(&cond_var);
         destroy_schedule( s );
@@ -112,6 +123,11 @@ int process_schedule_data( size_t len, uint8_t *data )
             pthread_mutex_lock( &schedule_lock );
             tmp = current_schedule;
             current_schedule = s;
+#if defined(ENABLE_FEATURE_TELEMETRY2_0)
+            destroy_notification_list(current_notifications);
+            current_notifications = build_notification_list(s);
+            next_pending_notification = current_notifications;
+#endif
             pthread_mutex_unlock( &schedule_lock );
             pthread_cond_signal(&cond_var);
             destroy_schedule(tmp);
@@ -287,6 +303,27 @@ void *scheduler_thread(void *args)
         if( next_report_time < tm.tv_sec ) {
             tm.tv_sec = next_report_time;
         }
+
+#if defined(ENABLE_FEATURE_TELEMETRY2_0)
+        /* Fire any due notifications */
+        if( current_schedule && next_pending_notification ) {
+            time_t weekly_now = convert_unix_time_to_weekly(current_unix_time);
+            next_pending_notification = fire_due_notifications(
+                next_pending_notification, current_schedule,
+                weekly_now, current_unix_time);
+
+            /* Include next notification time in timeout calculation */
+            time_t next_notif = get_next_notification_time(
+                next_pending_notification, weekly_now);
+            if( next_notif < SECONDS_IN_A_WEEK ) {
+                /* Convert weekly notification time to approximate unix time */
+                time_t notif_unix = current_unix_time + (next_notif - weekly_now);
+                if( notif_unix < tm.tv_sec ) {
+                    tm.tv_sec = notif_unix;
+                }
+            }
+        }
+#endif
 
         rv = pthread_cond_timedwait(&cond_var, &schedule_lock, &tm);
         if( (0 != rv) && (ETIMEDOUT != rv) ) {

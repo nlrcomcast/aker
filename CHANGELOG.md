@@ -5,6 +5,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- T2 downtime notifications (`AkerDowntimeNotification`) for schedule transitions. Emits JSON payloads via `t2_event_s` for four event types: `DOWNTIME_STARTING_SOON`, `DOWNTIME_STARTED`, `DOWNTIME_ENDING_SOON`, `DOWNTIME_ENDED`. Includes 15-minute pre-notifications. Guarded by `ENABLE_FEATURE_TELEMETRY2_0` build flag.
 
 ## [v1.2.0] - 2022-09-21
 ### Added
