@@ -95,3 +95,6 @@ Aker is an experimental MAC address blocking scheduler developed by Comcast (und
 - All external dependencies are pinned to specific Git commits for reproducible builds
 - The `tests/` directory contains pre-generated test data headers derived from JSON schedule definitions
 - Metric reporting was added in v1.1.0 and enhanced with assurance metrics and MAC validation in v1.2.0
+- **[Unreleased] T2 Downtime Notifications:** A new feature (`aker_notify.c/h`) emits JSON payloads via `t2_event_s` for four downtime lifecycle events (`DOWNTIME_STARTING_SOON`, `DOWNTIME_STARTED`, `DOWNTIME_ENDING_SOON`, `DOWNTIME_ENDED`) with 15-minute pre-notifications. Guarded by `ENABLE_FEATURE_TELEMETRY2_0` build flag. Designed as a pre-computed notification list diffed from consecutive schedule events.
+- The `docs/changes/` directory contains design documents, proposals, and specs for in-progress features
+- Please pay special attention to: understand the code for all the repos under the current workspace

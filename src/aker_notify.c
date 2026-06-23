@@ -296,8 +296,16 @@ notification_event_t* fire_due_notifications(notification_event_t *list,
                                              time_t unix_time)
 {
     while (list && list->fire_time <= weekly_time) {
+        /* Convert weekly scheduled_time to absolute Unix time */
+        time_t scheduled_unix_time;
+        time_t delta = list->scheduled_time - weekly_time;
+        if (delta < -(SECONDS_IN_A_WEEK / 2)) {
+            delta += SECONDS_IN_A_WEEK;
+        }
+        scheduled_unix_time = unix_time + delta;
+
         char *json = format_notification_json(list->type,
-                                              unix_time, /* Use unix_time as scheduled approx */
+                                              scheduled_unix_time,
                                               unix_time,
                                               s,
                                               list->mac_indexes,
