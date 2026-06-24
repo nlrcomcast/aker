@@ -35,6 +35,10 @@
 #include "aker_metrics.h"
 #include "time.h"
 
+#if defined(ENABLE_FEATURE_TELEMETRY2_0)
+#include "notify.h"
+#endif
+
 #ifdef INCLUDE_BREAKPAD
 #include "breakpad_wrapper.h"
 #endif
@@ -193,6 +197,22 @@ int main( int argc, char **argv)
         (NULL != md5_file) &&
         (NULL != device_id) )
     {
+#if defined(ENABLE_FEATURE_TELEMETRY2_0)
+        /* Persist already-sent notification boundaries alongside the schedule
+         * data so a restart inside the 15-minute lead does not skip a
+         * "*_SOON" notification. */
+        {
+            char *notify_file = (char*) aker_malloc( strlen(data_file) + 8 );
+            if( NULL != notify_file ) {
+                sprintf( notify_file, "%s.notify", data_file );
+                notify_init( notify_file );
+                aker_free( notify_file );
+            } else {
+                notify_init( NULL );
+            }
+        }
+#endif
+
         scheduler_start( &thread_id, firewall_cmd );
 
         import_existing_schedule( data_file, md5_file );
@@ -239,6 +259,10 @@ int main( int argc, char **argv)
     if (rv != 0) {
         debug_error("%s  program terminating\n", argv[0]);
     }
+
+#if defined(ENABLE_FEATURE_TELEMETRY2_0)
+    notify_destroy();
+#endif
 
     if( NULL != md5_file )          aker_free( md5_file );
     if( NULL != data_file )         aker_free( data_file );

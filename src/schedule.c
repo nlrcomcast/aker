@@ -50,6 +50,13 @@
 /*----------------------------------------------------------------------------*/
 char* __convert_event_to_string( schedule_t *s, schedule_event_t *e );
 int __validate_mac( const char *mac, size_t len );
+static bool __event_blocks( schedule_event_t *e, uint32_t mac_index );
+static bool __weekly_window( schedule_t *s, uint32_t mac_index, time_t weekly,
+                             time_t *start, time_t *end );
+static bool __absolute_window( schedule_t *s, uint32_t mac_index,
+                               time_t unixtime, time_t *start, time_t *end );
+static time_t __weekly_to_unix( time_t unixtime, time_t weekly_now,
+                                time_t weekly_target );
 
 
 
@@ -362,9 +369,423 @@ done:
 }
 
 
+/* See schedule.h for details. */
+bool get_mac_downtime_window( schedule_t *s, uint32_t mac_index,
+                              time_t unixtime, downtime_window_t *win )
+{
+    time_t weekly;
+    time_t w_start = 0, w_end = 0;
+    time_t a_start = 0, a_end = 0;
+    bool have_weekly, have_abs;
+
+    if( (NULL == s) || (NULL == win) ) {
+        return false;
+    }
+
+    weekly = convert_unix_time_to_weekly( unixtime );
+
+    have_weekly = __weekly_window( s, mac_index, weekly, &w_start, &w_end );
+    if( have_weekly ) {
+        /* Project the weekly (Sunday-relative) edges onto the absolute timeline. */
+        w_start = __weekly_to_unix( unixtime, weekly, w_start );
+        w_end   = __weekly_to_unix( unixtime, weekly, w_end );
+    }
+
+    have_abs = __absolute_window( s, mac_index, unixtime, &a_start, &a_end );
+
+    if( !have_weekly && !have_abs ) {
+        return false;
+    }
+
+    win->mac_index = mac_index;
+
+    if( have_weekly && have_abs ) {
+        /* Prefer a window that currently contains now; otherwise the one that
+         * starts soonest. */
+        bool w_now = (w_start <= unixtime) && (unixtime < w_end);
+        bool a_now = (a_start <= unixtime) && (unixtime < a_end);
+
+        if( a_now && !w_now ) {
+            win->start = a_start; win->end = a_end;
+        } else if( w_now && !a_now ) {
+            win->start = w_start; win->end = w_end;
+        } else if( a_start <= w_start ) {
+            win->start = a_start; win->end = a_end;
+        } else {
+            win->start = w_start; win->end = w_end;
+        }
+    } else if( have_abs ) {
+        win->start = a_start; win->end = a_end;
+    } else {
+        win->start = w_start; win->end = w_end;
+    }
+
+    return true;
+}
+
+
+/* See schedule.h for details. */
+time_t get_next_notify_boundary( schedule_t *s, time_t unixtime )
+{
+    time_t next = INT_MAX;
+    size_t i;
+
+    if( NULL == s ) {
+        return INT_MAX;
+    }
+
+    for( i = 0; i < s->mac_count; i++ ) {
+        downtime_window_t win;
+        time_t ref = unixtime;
+        int guard;
+
+        /* Walk forward window-by-window for this MAC, gathering the four
+         * candidate boundaries (start, end, and each minus the lead) until we
+         * find the earliest that is strictly in the future.  The guard bounds
+         * the walk in case every boundary is in the past. */
+        for( guard = 0; guard < 8; guard++ ) {
+            time_t cand[4];
+            size_t c;
+
+            if( !get_mac_downtime_window( s, (uint32_t) i, ref, &win ) ) {
+                break;
+            }
+
+            cand[0] = win.start - NOTIFY_LEAD_SECONDS;
+            cand[1] = win.start;
+            cand[2] = win.end - NOTIFY_LEAD_SECONDS;
+            cand[3] = win.end;
+
+            for( c = 0; c < 4; c++ ) {
+                if( (cand[c] > unixtime) && (cand[c] < next) ) {
+                    next = cand[c];
+                }
+            }
+
+            /* Advance past this window's end to discover the next window. */
+            ref = win.end + 1;
+
+            /* If we already found a boundary at or before this window's end we
+             * cannot do better for this MAC by looking further out. */
+            if( next <= win.end ) {
+                break;
+            }
+        }
+    }
+
+    debug_info( "Next notify boundary: %ld\n", next );
+    return next;
+}
+
+
+/* See schedule.h for details. */
+size_t collect_notify_batch( schedule_t *s, time_t instant,
+                             downtime_event_t event,
+                             downtime_window_t *out, size_t max )
+{
+    size_t count = 0;
+    size_t i;
+
+    if( (NULL == s) || (NULL == out) ) {
+        return 0;
+    }
+
+    for( i = 0; (i < s->mac_count) && (count < max); i++ ) {
+        downtime_window_t win;
+        bool matched = false;
+        int pass;
+
+        /* A downtime window is half-open [start, end): at the exact end instant
+         * get_mac_downtime_window() resolves to the *next* window, so for the
+         * end-based edges we also probe one second earlier to catch the window
+         * that is closing precisely now. */
+        for( pass = 0; (pass < 2) && !matched; pass++ ) {
+            time_t ref = (0 == pass) ? instant : (instant - 1);
+            time_t edge;
+
+            if( !get_mac_downtime_window( s, (uint32_t) i, ref, &win ) ) {
+                break;
+            }
+
+            switch( event ) {
+                case DOWNTIME_STARTING_SOON: edge = win.start - NOTIFY_LEAD_SECONDS; break;
+                case DOWNTIME_STARTED:       edge = win.start;                       break;
+                case DOWNTIME_ENDING_SOON:   edge = win.end - NOTIFY_LEAD_SECONDS;   break;
+                case DOWNTIME_ENDED:         edge = win.end;                         break;
+                default:                     edge = INT_MAX;                         break;
+            }
+
+            if( edge == instant ) {
+                out[count++] = win;
+                matched = true;
+            }
+        }
+    }
+
+    return count;
+}
+
+
 /*----------------------------------------------------------------------------*/
 /*                             Internal functions                             */
 /*----------------------------------------------------------------------------*/
+
+
+/**
+ *  Returns true if the event's block list contains the given MAC index.
+ *
+ *  @param e         the event to inspect
+ *  @param mac_index the MAC index to look for
+ *
+ *  @return true if blocked by this event, false otherwise
+ */
+static bool __event_blocks( schedule_event_t *e, uint32_t mac_index )
+{
+    size_t i;
+
+    if( NULL == e ) {
+        return false;
+    }
+
+    for( i = 0; i < e->block_count; i++ ) {
+        if( e->block[i] == mac_index ) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+/**
+ *  Converts a weekly time (seconds since Sunday midnight) into the absolute
+ *  Unix instant of its occurrence relative to @p unixtime / @p weekly_now.
+ *
+ *  @param unixtime    the reference absolute instant
+ *  @param weekly_now  the weekly time corresponding to @p unixtime
+ *  @param weekly_target the weekly time to project
+ *
+ *  @return the absolute Unix instant of weekly_target in the current week
+ */
+static time_t __weekly_to_unix( time_t unixtime, time_t weekly_now,
+                                time_t weekly_target )
+{
+    return (unixtime - weekly_now) + weekly_target;
+}
+
+
+/**
+ *  Computes the current-or-next downtime window for a MAC over the absolute
+ *  (one-time) schedule.  Absolute event times are already absolute Unix
+ *  instants and the timeline is linear (no weekly wrap).  Consistent with
+ *  get_blocked_at_time(), the final absolute event acts as a terminator and
+ *  cannot itself open a window.
+ *
+ *  @param s         the schedule to evaluate
+ *  @param mac_index the MAC index to resolve
+ *  @param unixtime  the reference absolute instant
+ *  @param start     [out] the window start (absolute Unix time)
+ *  @param end       [out] the window end (absolute Unix time)
+ *
+ *  @return true if a current-or-upcoming absolute window exists, else false
+ */
+static bool __absolute_window( schedule_t *s, uint32_t mac_index,
+                               time_t unixtime, time_t *start, time_t *end )
+{
+    schedule_event_t *p;
+    time_t cur_start = 0;
+    bool in_window = false;
+    time_t best_start = INT_MAX, best_end = INT_MAX;
+    bool found = false;
+
+    if( (NULL == s) || (NULL == s->absolute) ) {
+        return false;
+    }
+
+    for( p = s->absolute; (NULL != p) && (NULL != p->next); p = p->next ) {
+        bool now_blocked = __event_blocks( p, mac_index );
+
+        if( now_blocked && !in_window ) {
+            cur_start = p->time;
+            in_window = true;
+        } else if( !now_blocked && in_window ) {
+            time_t w_end = p->time;
+            in_window = false;
+
+            if( (cur_start <= unixtime) && (unixtime < w_end) ) {
+                *start = cur_start;
+                *end = w_end;
+                return true;
+            }
+            if( (cur_start >= unixtime) && (cur_start < best_start) ) {
+                best_start = cur_start;
+                best_end = w_end;
+                found = true;
+            }
+        }
+    }
+
+    /* A window still open when the terminator event is reached closes at the
+     * terminator's time. */
+    if( in_window && (NULL != p) ) {
+        time_t w_end = p->time;
+
+        if( (cur_start <= unixtime) && (unixtime < w_end) ) {
+            *start = cur_start;
+            *end = w_end;
+            return true;
+        }
+        if( (cur_start >= unixtime) && (cur_start < best_start) ) {
+            best_start = cur_start;
+            best_end = w_end;
+            found = true;
+        }
+    }
+
+    if( found ) {
+        *start = best_start;
+        *end = best_end;
+        return true;
+    }
+
+    return false;
+}
+
+
+/**
+ *  Computes the current-or-next downtime window for a MAC over the weekly
+ *  schedule, treated as a circular timeline.  Returned edges are weekly times
+ *  (seconds since Sunday midnight) and the end may be numerically larger than
+ *  SECONDS_IN_A_WEEK when the window wraps past Sunday midnight.
+ *
+ *  The walk collects every maximal blocked span as a (rising-edge, falling-edge)
+ *  pair, then selects the span that is current at @p weekly or, failing that,
+ *  the soonest upcoming one (wrapping to the first span of the next week when
+ *  @p weekly is past them all).
+ *
+ *  @param s         the schedule to evaluate
+ *  @param mac_index the MAC index to resolve
+ *  @param weekly    the reference weekly time
+ *  @param start     [out] the window start (weekly time)
+ *  @param end       [out] the window end (weekly time, possibly > 1 week)
+ *
+ *  @return true if a window exists, false if the MAC is never blocked or is
+ *          blocked across every event with no gap
+ */
+static bool __weekly_window( schedule_t *s, uint32_t mac_index, time_t weekly,
+                             time_t *start, time_t *end )
+{
+    schedule_event_t *p, *last_real;
+    size_t total, blocking;
+    bool prev_blocked;
+    time_t cur_start = 0;
+    bool in_window = false;
+    time_t first_start = INT_MAX, first_end = INT_MAX;
+    time_t best_start = INT_MAX, best_end = INT_MAX;
+    bool found = false;
+
+    if( (NULL == s) || (NULL == s->weekly) ) {
+        return false;
+    }
+
+    /* Count real events (skipping the negative-time wrap sentinel) and how many
+     * block this MAC, to detect the never-blocked and always-blocked cases. */
+    total = blocking = 0;
+    last_real = NULL;
+    for( p = s->weekly; NULL != p; p = p->next ) {
+        if( 0 > p->time ) {
+            continue;
+        }
+        total++;
+        last_real = p;
+        if( __event_blocks( p, mac_index ) ) {
+            blocking++;
+        }
+    }
+
+    if( (0 == blocking) || (blocking == total) ) {
+        return false;
+    }
+
+    /* Seed the "previous" membership from the last real event so the circular
+     * timeline is honoured: a window open at week's end continues into the
+     * next week. */
+    prev_blocked = __event_blocks( last_real, mac_index );
+    if( prev_blocked ) {
+        /* A window is already open as the week begins; it started at the last
+         * rising edge of the previous week.  Find that edge by scanning for the
+         * last falling->rising transition, expressed as a negative offset. */
+        bool pblk = false;
+        time_t open_at = last_real->time - SECONDS_IN_A_WEEK;
+        for( p = s->weekly; NULL != p; p = p->next ) {
+            bool b;
+            if( 0 > p->time ) {
+                continue;
+            }
+            b = __event_blocks( p, mac_index );
+            if( b && !pblk ) {
+                open_at = p->time - SECONDS_IN_A_WEEK;
+            }
+            pblk = b;
+        }
+        cur_start = open_at;
+        in_window = true;
+    }
+
+    for( p = s->weekly; NULL != p; p = p->next ) {
+        bool now_blocked;
+
+        if( 0 > p->time ) {
+            continue;
+        }
+        now_blocked = __event_blocks( p, mac_index );
+
+        if( now_blocked && !in_window ) {
+            cur_start = p->time;
+            in_window = true;
+        } else if( !now_blocked && in_window ) {
+            time_t w_start = cur_start;
+            time_t w_end = p->time;
+
+            in_window = false;
+
+            if( INT_MAX == first_start ) {
+                first_start = w_start;
+                first_end = w_end;
+            }
+
+            /* Current window: weekly falls within [start, end). */
+            if( (w_start <= weekly) && (weekly < w_end) ) {
+                *start = w_start;
+                *end = w_end;
+                return true;
+            }
+
+            /* Soonest upcoming window starting at or after now. */
+            if( (w_start > weekly) && (w_start < best_start) ) {
+                best_start = w_start;
+                best_end = w_end;
+                found = true;
+            }
+        }
+    }
+
+    if( found ) {
+        *start = best_start;
+        *end = best_end;
+        return true;
+    }
+
+    /* Past every window this week: wrap to the first window of next week. */
+    if( INT_MAX != first_start ) {
+        *start = first_start + SECONDS_IN_A_WEEK;
+        *end = first_end + SECONDS_IN_A_WEEK;
+        return true;
+    }
+
+    return false;
+}
+
 
 
 /**

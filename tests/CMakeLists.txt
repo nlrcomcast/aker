@@ -196,6 +196,17 @@ if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
 target_link_libraries (test_aker_metrics ${AKER_LINUX_LIBS})
 endif()
 
+#-------------------------------------------------------------------------------
+#   test_notify
+#-------------------------------------------------------------------------------
+add_test(NAME test_notify COMMAND ${MEMORY_CHECK} ./test_notify)
+add_executable(test_notify test_notify.c ../src/notify.c ../src/schedule.c
+               ../src/time.c ../src/schedule_print.c mem_wrapper.c)
+target_link_libraries (test_notify ${AKER_COMMON_LIBS})
+if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+target_link_libraries (test_notify ${AKER_LINUX_LIBS})
+endif()
+
 add_custom_target(coverage
 COMMAND lcov -q --capture --directory 
 ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/test_time.dir/__/src --output-file time.info

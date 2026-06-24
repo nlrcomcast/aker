@@ -17,6 +17,7 @@
 #ifndef __SCHEDULE_H__
 #define __SCHEDULE_H__
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
 #include <pthread.h>
@@ -25,6 +26,20 @@
 /*                                   Macros                                   */
 /*----------------------------------------------------------------------------*/
 #define MAC_ADDRESS_SIZE         18
+
+/* The lead time, in seconds, before a downtime window edge at which a
+ * "*_SOON" notification is emitted (15 minutes). */
+#define NOTIFY_LEAD_SECONDS      (15 * 60)
+
+/* The four downtime lifecycle notification event types.  The ordering matters
+ * only for deterministic tie-breaking when several events share an instant. */
+typedef enum {
+    DOWNTIME_NOTIFY_NONE = 0,
+    DOWNTIME_STARTING_SOON,
+    DOWNTIME_STARTED,
+    DOWNTIME_ENDING_SOON,
+    DOWNTIME_ENDED
+} downtime_event_t;
 
 /*----------------------------------------------------------------------------*/
 /*                               Data Structures                              */
@@ -191,5 +206,66 @@ void print_schedule( schedule_t *s );
  * @return the Epoch time of next imminent schedule event
  */
 time_t get_next_unixtime(schedule_t *s, time_t unixtime);
+
+/**
+ *  Describes a single downtime lifecycle transition for one MAC, resolved to
+ *  an absolute Unix instant.
+ */
+typedef struct downtime_window {
+    uint32_t mac_index;    /* Index into schedule_t::macs of the affected MAC. */
+    time_t   start;        /* Absolute Unix time the window starts. */
+    time_t   end;          /* Absolute Unix time the window ends. */
+} downtime_window_t;
+
+
+/**
+ *  Computes, for a given MAC index, the downtime window that is current or next
+ *  upcoming relative to @p unixtime, derived by walking the ordered weekly (and
+ *  absolute) events.  The weekly schedule is treated as a circular timeline so a
+ *  window straddling Sunday midnight is returned as a single span.
+ *
+ *  @param s         the schedule to evaluate
+ *  @param mac_index the MAC index to resolve a window for
+ *  @param unixtime  the reference instant
+ *  @param win       [out] populated with the resolved absolute window edges
+ *
+ *  @return true if a window was found for the MAC, false otherwise (e.g. the
+ *          MAC is never blocked, or is blocked across every event with no gap)
+ */
+bool get_mac_downtime_window( schedule_t *s, uint32_t mac_index,
+                              time_t unixtime, downtime_window_t *win );
+
+
+/**
+ *  Computes the next notification boundary at or after @p unixtime across all
+ *  MACs and all four event types (each window start, each window end, and each
+ *  edge minus NOTIFY_LEAD_SECONDS).
+ *
+ *  @param s        the schedule to evaluate
+ *  @param unixtime the reference instant (boundaries strictly greater than this
+ *                  are considered)
+ *
+ *  @return the absolute Unix time of the next boundary, or INT_MAX if none
+ */
+time_t get_next_notify_boundary( schedule_t *s, time_t unixtime );
+
+
+/**
+ *  Collects every (MAC, event type) transition whose absolute instant equals
+ *  @p instant, grouped by event type.  The caller iterates the four event types
+ *  and, for each, receives the list of affected MAC indexes and their resolved
+ *  window edges so a single batched notification can be emitted.
+ *
+ *  @param s        the schedule to evaluate
+ *  @param instant  the absolute Unix instant to match transitions against
+ *  @param event    the event type to collect
+ *  @param out      [out] caller-allocated array to receive matching windows
+ *  @param max      the capacity of @p out
+ *
+ *  @return the number of entries written to @p out (0 if none match)
+ */
+size_t collect_notify_batch( schedule_t *s, time_t instant,
+                             downtime_event_t event,
+                             downtime_window_t *out, size_t max );
 
 #endif

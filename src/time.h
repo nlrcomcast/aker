@@ -48,5 +48,18 @@ time_t get_unix_time(void);
 int set_unix_time_zone (const char *time_zone);
 
 
+/**
+ *  Formats an absolute Unix instant as a human-readable UTC ISO-8601 string
+ *  with a trailing 'Z', e.g. "2026-06-05T20:00:00Z".
+ *
+ *  @param unixtime the absolute instant to format
+ *  @param buf      the destination buffer
+ *  @param len      the size of @p buf (at least 21 bytes recommended)
+ *
+ *  @return the number of characters written (excluding the NUL), or 0 on error
+ */
+size_t format_utc_iso8601( time_t unixtime, char *buf, size_t len );
+
+
 
 #endif

@@ -103,6 +103,23 @@ int set_unix_time_zone (const char *time_zone)
    
    return rv;
 }
+
+/* See time.h for details. */
+size_t format_utc_iso8601( time_t unixtime, char *buf, size_t len )
+{
+    struct tm tm_utc;
+
+    if( (NULL == buf) || (0 == len) ) {
+        return 0;
+    }
+
+    if( NULL == gmtime_r( &unixtime, &tm_utc ) ) {
+        buf[0] = '\0';
+        return 0;
+    }
+
+    return strftime( buf, len, "%Y-%m-%dT%H:%M:%SZ", &tm_utc );
+}
 /*----------------------------------------------------------------------------*/
 /*                             Internal functions                             */
 /*----------------------------------------------------------------------------*/

@@ -34,6 +34,10 @@
 #include "aker_mem.h"
 #include "aker_metrics.h"
 
+#if defined(ENABLE_FEATURE_TELEMETRY2_0)
+#include "notify.h"
+#endif
+
 #ifdef INCLUDE_BREAKPAD
 #include "breakpad_wrapper.h"
 #endif
@@ -158,6 +162,9 @@ void *scheduler_thread(void *args)
     int rv = ETIMEDOUT;
     uint32_t last_report_rate = 0;
     uint32_t report_jitter = 0; /* seconds */
+#if defined(ENABLE_FEATURE_TELEMETRY2_0)
+    time_t notify_scan_from = 0;
+#endif
     
     signal(SIGTERM, sig_handler);
     signal(SIGINT, sig_handler);
@@ -274,6 +281,30 @@ void *scheduler_thread(void *args)
             report_metrics_to_log = 0;
         }
 
+#if defined(ENABLE_FEATURE_TELEMETRY2_0)
+        /* Emit any downtime lifecycle notifications whose boundary instant is
+         * at or before now and has not yet been sent.  notify_emit() suppresses
+         * already-sent boundaries via its persisted state, so overlapping scans
+         * (including the first scan after a restart) never duplicate. */
+        if( current_schedule ) {
+            time_t from = notify_scan_from;
+            time_t b;
+
+            if( 0 == from ) {
+                /* First scan: look back one lead interval so a "*_SOON" whose
+                 * trigger passed during a restart is still emitted. */
+                from = current_unix_time - NOTIFY_LEAD_SECONDS - 1;
+            }
+
+            b = get_next_notify_boundary( current_schedule, from );
+            while( (INT_MAX != b) && (b <= current_unix_time) ) {
+                notify_emit( current_schedule, b, current_unix_time );
+                b = get_next_notify_boundary( current_schedule, b );
+            }
+            notify_scan_from = current_unix_time;
+        }
+#endif
+
         /* Never report if disabled */
         next_report_time = INT_MAX;
         if( current_schedule && (0 < current_schedule->report_rate_s) ) {
@@ -287,6 +318,16 @@ void *scheduler_thread(void *args)
         if( next_report_time < tm.tv_sec ) {
             tm.tv_sec = next_report_time;
         }
+
+#if defined(ENABLE_FEATURE_TELEMETRY2_0)
+        /* Also wake in time for the next downtime notification boundary. */
+        if( current_schedule ) {
+            time_t nb = get_next_notify_boundary( current_schedule, current_unix_time );
+            if( nb < tm.tv_sec ) {
+                tm.tv_sec = nb;
+            }
+        }
+#endif
 
         rv = pthread_cond_timedwait(&cond_var, &schedule_lock, &tm);
         if( (0 != rv) && (ETIMEDOUT != rv) ) {
